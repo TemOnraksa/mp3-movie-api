@@ -1,5 +1,4 @@
 import io
-import json
 import logging
 from pathlib import Path
 
@@ -8,22 +7,24 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 
 from data_pipeline import create_cleaning_report, process_data, validate_dataframe
 from src import (
-    DatasetInfo,
-    DatasetStorage,
     HealthResponse,
+    MovieDataResponse,
+    MovieProcessingReport,
+    MovieStorage,
+    MovieUploadInfo,
     ProcessConfig,
-    ProcessingReport,
     log_requests,
     setup_logging,
 )
+from src.storage import MOVIE_COLUMNS
 
 setup_logging(verbose=True)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Data Processing API", version="1.0.0")
+app = FastAPI(title="Movie API", version="1.0.0")
 app.middleware("http")(log_requests)
 
-storage = DatasetStorage()
+storage = MovieStorage()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -32,16 +33,15 @@ def health_check():
     return {"status": "ok", "version": "1.0.0"}
 
 
-@app.post("/upload", response_model=DatasetInfo)
-async def upload_dataset(file: UploadFile = File(...)):
-    """Read and store a CSV upload."""
-    # Only accept CSV files
+@app.post("/upload", response_model=MovieUploadInfo)
+async def upload_movies(file: UploadFile = File(...)):
+    """Read a movie CSV and replace the stored collection."""
+    # 1. Only accept CSV files, then read them like in MP2
     suffix = Path(file.filename or "").suffix.lower()
     if suffix != ".csv":
         logger.warning(f"Unsupported file format: {suffix}")
         raise HTTPException(status_code=400, detail=f"Unsupported file format: {suffix}. Please upload a .csv file.")
 
-    # Read the uploaded bytes and turn them into a DataFrame
     contents = await file.read()
     try:
         df = pd.read_csv(io.BytesIO(contents))
@@ -49,71 +49,78 @@ async def upload_dataset(file: UploadFile = File(...)):
         logger.warning(f"Could not read CSV file {file.filename}: {error}")
         raise HTTPException(status_code=400, detail="Could not read the CSV file. Make sure it is a valid, non-empty CSV.")
 
-    dataset_id = storage.save(df, file.filename)
-    logger.info(f"Uploaded dataset: id={dataset_id}, filename={file.filename}, rows={len(df)}")
+    # 2. Quick checks before saving: the right columns and at least one row
+    if sorted(df.columns) != sorted(MOVIE_COLUMNS):
+        logger.warning(f"Wrong columns: {list(df.columns)}")
+        raise HTTPException(status_code=400, detail=f"The CSV must have exactly these columns: {MOVIE_COLUMNS}")
 
-    return storage.get_metadata(dataset_id)
+    if df.empty:
+        logger.warning("Uploaded CSV has no data rows")
+        raise HTTPException(status_code=400, detail="The CSV has no data rows.")
+
+    df = df[MOVIE_COLUMNS]
+
+    # 3. Replace the stored movies
+    storage.save(df)
+    logger.info(f"Uploaded movies: filename={file.filename}, rows={len(df)}")
+
+    return {
+        "filename": file.filename,
+        "rows": len(df),
+        "columns": len(df.columns),
+        "column_names": list(df.columns),
+    }
 
 
-@app.get("/datasets/{dataset_id}")
-def get_dataset(dataset_id: int, limit: int = Query(default=100, ge=1)):
-    """Return up to limit rows from a stored dataset."""
-    df = storage.get(dataset_id)
-    if df is None:
-        logger.warning(f"Dataset not found: {dataset_id}")
-        raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
+@app.get("/movies", response_model=MovieDataResponse)
+def get_movies(limit: int = Query(default=100, ge=1)):
+    """Return up to limit movies from SQLite."""
+    data = storage.select_columns(MOVIE_COLUMNS, limit)
+    total_rows = storage.count_movies()
 
-    # to_json turns missing values into null
-    records = json.loads(df.head(limit).to_json(orient="records"))
-    logger.info(f"Retrieved dataset: id={dataset_id}, returned_rows={len(records)}")
-
-    return {"id": dataset_id, "data": records, "total_rows": len(df)}
+    logger.info(f"Retrieved movies: returned_rows={len(data)}")
+    return {"data": data, "total_rows": total_rows}
 
 
-@app.post("/datasets/{dataset_id}/process", response_model=ProcessingReport)
-def process_dataset(dataset_id: int, config: ProcessConfig):
-    """Validate and process a stored dataset using MP1 functions."""
-    # 1. Get a copy of the stored dataset
-    df = storage.get(dataset_id)
-    if df is None:
-        logger.warning(f"Dataset not found: {dataset_id}")
-        raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
+@app.post("/movies/process", response_model=MovieProcessingReport)
+def process_movies(config: ProcessConfig):
+    """Validate and clean the stored movies using MP1 functions."""
+    # 1. Get the stored movies
+    df = storage.get()
+    if df.empty:
+        logger.warning("No movies to process")
+        raise HTTPException(status_code=400, detail="No movies to process. Upload a CSV first.")
 
-    # 2. Turn the request body into the same dictionary shape as MP1's config.yaml
+    # 2. Same steps as MP2: settings, numeric column check, validate, clean
     settings = config.model_dump()
     required_columns = settings["validation"]["required_columns"]
     numeric_columns = settings["validation"]["numeric_columns"]
 
-    # 3. Every numeric column must exist in the data
     for col in numeric_columns:
         if col not in df.columns:
             logger.warning(f"Numeric column not found: {col}")
             raise HTTPException(status_code=400, detail=f"Numeric column not found: {col}")
 
-    # 4-6. Validate, then clean, using the MP1 functions
     try:
         validated = validate_dataframe(df, required_columns, numeric_columns)
         validation_rows_removed = len(df) - len(validated)
-        logger.info(f"Validated dataset: id={dataset_id}, rows_removed={validation_rows_removed}")
+        logger.info(f"Validated movies: rows_removed={validation_rows_removed}")
 
         df_before = validated.copy()
         processed = process_data(validated, settings)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
-    # 7. Compare the validated data with the cleaned data
     report = create_cleaning_report(df_before, processed)
 
-    # 8. Only save once validation and processing both worked
-    storage.update(dataset_id, processed)
+    # 3. Save the cleaned movies
+    storage.save(processed)
     logger.info(
-        f"Processed dataset: id={dataset_id}, validation_removed={validation_rows_removed}, "
+        f"Processed movies: validation_removed={validation_rows_removed}, "
         f"rows_before={report['rows_before']}, rows_after={report['rows_after']}"
     )
 
-    # 9. Return the report
     return {
-        "id": dataset_id,
         "validation_rows_removed": validation_rows_removed,
         "cleaning_report": report,
     }
