@@ -82,6 +82,22 @@ def get_movies(limit: int = Query(default=100, ge=1)):
     return {"data": data, "total_rows": total_rows}
 
 
+@app.get("/movies/search", response_model=list[dict])
+def query_movies(
+    columns: list[str] = Query(default=["title"]),
+    min_rating: float = Query(default=0, ge=0, le=10),
+    limit: int = Query(default=100, ge=1)
+):
+    """Return chosen columns for movies with at least min_rating."""
+    try:
+        results = storage.query_movies(columns, min_rating, limit)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    logger.info(f"Queried movies: columns={columns}, min_rating={min_rating}, returned_rows={len(results)}")
+    return results
+
+
 @app.post("/movies/process", response_model=MovieProcessingReport)
 def process_movies(config: ProcessConfig):
     """Validate and clean the stored movies using MP1 functions."""
